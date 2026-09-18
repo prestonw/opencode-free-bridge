@@ -5,10 +5,11 @@ and can use the keyless free models that a direct API call 403s).
 
 Usage: OPENCODE_BRIDGE_PORT=4059 python3 opencode_bridge.py
 """
-import http.server, json, urllib.request, os, sys
+import http.server, json, urllib.request, os, sys, secrets
 
 OP_BASE = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:4090")
 PORT = int(os.environ.get("OPENCODE_BRIDGE_PORT", "4059"))
+BRIDGE_TOKEN = os.environ.get("OPENCODE_BRIDGE_TOKEN", "") or secrets.token_urlsafe(24)
 
 FREE_MODELS = [
     "ling-3.0-flash-fin-free",
@@ -83,7 +84,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _authorized(self):
+        auth = self.headers.get("Authorization", "")
+        return auth == f"Bearer {BRIDGE_TOKEN}"
+
     def do_GET(self):
+        if not self._authorized():
+            self._send({"error": "unauthorized"}, 401)
+            return
         if self.path.startswith("/v1/models"):
             self._send({"object": "list", "data": [{"id": m, "object": "model"} for m in FREE_MODELS]})
         elif self.path in ("/health", "/v1/health"):
@@ -92,6 +100,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._authorized():
+            self._send({"error": "unauthorized"}, 401)
+            return
         if self.path == "/v1/chat/completions":
             n = int(self.headers.get("Content-Length", 0))
             try:
@@ -128,4 +139,6 @@ if __name__ == "__main__":
     from http.server import ThreadingHTTPServer
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"opencode free bridge on http://127.0.0.1:{PORT}/v1", flush=True)
+    if not os.environ.get("OPENCODE_BRIDGE_TOKEN"):
+        print(f"auth token (set OPENCODE_BRIDGE_TOKEN to pin): {BRIDGE_TOKEN}", flush=True)
     srv.serve_forever()

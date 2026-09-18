@@ -77,3 +77,23 @@ wired into both the main-turn and auxiliary request paths.
 ## Rotation / security
 
 The Go API key was pasted into chat during this work — rotate it.
+
+## Jev (TypeSafe) review
+
+Ran `jev-latest` over `opencode_bridge.py` before publishing:
+
+| question | probability |
+|---|---|
+| contains hardcoded secrets | **0.08** (no — reads from env only) |
+| obvious security vulnerabilities | **0.77** (see below) |
+| production-ready | **0.14** (minimal, non-streaming) |
+
+Mitigation applied: bearer-token auth is now **always on** (a random token is
+generated and printed at startup if `OPENCODE_BRIDGE_TOKEN` is unset).
+
+Remaining concern Jev is flagging: the bridge routes prompts to OpenCode's
+**"build" agent**, which has tool/command-execution access — it is not a pure chat
+model. So this is *not* a sandboxed chat endpoint; treat it as an authenticated
+front-end to a coding agent. Security model: `127.0.0.1` bind + bearer token +
+tailnet-only exposure. Do not `funnel` it to the public internet.
+

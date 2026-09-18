@@ -82,6 +82,11 @@ free models. (The bridge ignores the `Authorization` header, so any placeholder 
 `muse-spark-1.3-contributor-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,
 `big-pickle`.
 
+## Tailscale exposure
+
+Each service gets its own hostname + free HTTPS cert via Tailscale services — see
+[`tailscale.md`](tailscale.md).
+
 ## Limitations
 
 - **Non-streaming.** The bridge returns a complete response, not an SSE stream.
