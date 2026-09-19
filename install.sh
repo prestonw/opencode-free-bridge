@@ -128,6 +128,16 @@ PY
   # shellcheck disable=SC1090
   source "$ENV_FILE"
 
+  # The free tier must run KEYLESS: any auth.json (paid Go/zen key) in the data
+  # dir makes the client route free-model requests through Console's per-workspace
+  # quota accounting, which rate-limits and the client retries silently (looks like
+  # a hang). A dedicated keyless XDG_DATA_HOME avoids that entirely.
+  if [[ ! -f "$REPO_DIR/data/.config_ready" ]]; then
+    mkdir -p "$REPO_DIR/data"
+    touch "$REPO_DIR/data/.config_ready"
+  fi
+  [[ ! -f "$REPO_DIR/data/auth.json" ]] || { say "ERROR: $REPO_DIR/data/auth.json must not exist (free tier must be keyless)"; die "remove $REPO_DIR/data/auth.json"; }
+
   local serve_bin
   serve_bin="$(command -v opencode)"
 
@@ -142,6 +152,8 @@ Restart=on-failure
 RestartSec=3
 Environment=PATH=$HOME/.local/npm/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=$HOME
+Environment=XDG_DATA_HOME=$REPO_DIR/data/opencode-share
+Environment=XDG_CONFIG_HOME=$REPO_DIR/data/opencode-config
 WorkingDirectory=$REPO_DIR
 StandardOutput=append:$REPO_DIR/logs/opencode-serve.log
 StandardError=append:$REPO_DIR/logs/opencode-serve.log
@@ -212,6 +224,11 @@ install_macos() {
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>XDG_DATA_HOME</key><string>$REPO_DIR/data/opencode-share</string>
+    <key>XDG_CONFIG_HOME</key><string>$REPO_DIR/data/opencode-config</string>
+  </dict>
   <key>StandardOutPath</key><string>$REPO_DIR/logs/opencode-serve.log</string>
   <key>StandardErrorPath</key><string>$REPO_DIR/logs/opencode-serve.log</string>
 </dict>
@@ -319,7 +336,7 @@ PY
     -H "Authorization: Bearer ${OPENCODE_BRIDGE_TOKEN}" \
     -H "Content-Type: application/json" \
     -d "{\"model\":\"$default_model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: ok\"}]}")"
-  echo "$curl_out" | grep -q '"finish_reason":"stop"' \
+  echo "$curl_out" | grep -q '"finish_reason":[[:space:]]*"stop"' \
     || die "test completion failed: $curl_out"
   say "test completion OK: $(echo "$curl_out" | head -c200)"
 }
@@ -385,7 +402,7 @@ case "${1:-install}" in
     verify
     install_hermes "${2:-}"
     say "done. bridge: http://127.0.0.1:$BRIDGE_PORT/v1 (token in $ENV_FILE)"
-    say "hermes alias: /model opencode-free-bridge/$default_model"
+    say "hermes alias: /model opencode-free-bridge/$(cat "$REPO_DIR/.default_model" 2>/dev/null || echo muse-spark-1.3-contributor-free)"
     say "n.b. token is also in $ENV_FILE — add to shell rc as 'export OPENCODE_BRIDGE_TOKEN=...' if needed"
     ;;
   uninstall)

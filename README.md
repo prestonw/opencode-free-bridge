@@ -112,10 +112,20 @@ providers:
 
 ## Troubleshooting
 
-- **Requests hang / empty responses.** The upstream free tier can throttle or hang.
-  Sanity-check the path with a paid model through the same CLI:
-  `opencode run -m opencode-go/<your-go-model> 'Reply ok'`. If that answers fast while
-  free models stall, it's upstream, not the bridge — check OpenCode's status.
+- **Requests hang / empty responses.** Check opencode's own log first:
+  `tail ~/.local/share/opencode/log/opencode.log` (or
+  `$XDG_DATA_HOME/opencode/log/opencode.log` for the service instance). The known
+  causes, in order of likelihood:
+  1. **A paid key (`auth.json`) is present in the server's data dir.** Free-model
+     requests then go through Console's per-workspace quota accounting, the server
+     gets rate-limited, and the client silently retries with backoff — which looks
+     exactly like a hang. The installer isolates the service with its own
+     `XDG_DATA_HOME`/`XDG_CONFIG_HOME` under `data/` and refuses to run if a key
+     exists there. Keep paid keys in your normal user opencode install, separate
+     from the free-tier server.
+  2. **Upstream throttling** — test with a paid model through the same CLI:
+     `opencode run -m opencode-go/<your-go-model> 'Reply ok'`. If the paid model is
+     fast while free models stall, it's upstream, not the bridge.
 - **`{"error":"unauthorized"}`** — client token doesn't match `bridge.env` / Hermes
   `.env`. Same token must be in both.
 - **systemd: `systemctl --user status opencode-serve opencode-bridge`** and the
