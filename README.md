@@ -4,6 +4,8 @@ Route OpenCode's keyless **free** models (`ling-3.0-flash-fin-free`,
 `muse-spark-1.3-contributor-free`, `mimo-v2.5-free`, `nemotron-*`, etc.) through any
 OpenAI-compatible client — Hermes, or anything else that speaks `/v1/chat/completions`.
 
+Works on **Linux (systemd user units)** and **macOS (launchd)**.
+
 ## Why this exists
 
 OpenCode's free tier returns, on **direct** API calls:
@@ -23,77 +25,114 @@ HTTP API so Hermes (or any client) can use them too.
 ## Architecture
 
 ```
-Hermes  ──POST /v1/chat/completions──▶  opencode_bridge.py  ──▶  opencode serve  ──▶  opencode.ai (free tier)
-  127.0.0.1:4059                        (this repo)              127.0.0.1:4090
+Hermes / any client ──POST /v1/chat/completions──▶  opencode_bridge.py  ──▶  opencode serve  ──▶  opencode.ai (free tier)
+                                                  (this repo, :4059)        (:4090)
 ```
 
 The bridge is stateless: it creates a fresh `opencode` session per request, folds the
 full message history into the prompt, and extracts the assistant text from the response.
 
-## Setup
-
-### 1. Install the OpenCode CLI
+## Install (Linux + macOS)
 
 ```bash
-npm i -g opencode-ai
-# NixOS: the global npm prefix is read-only, so:
-npm config set prefix "$HOME/.local/npm"
-npm i -g opencode-ai
-export PATH="$HOME/.local/npm/bin:$PATH"
+git clone https://github.com/prestonw/opencode-free-bridge
+cd opencode-free-bridge
+./install.sh
 ```
 
-### 2. Start the OpenCode server (the "within OpenCode" client)
+What it does:
+
+1. Installs `opencode-ai` via npm if missing (handles NixOS read-only global prefix).
+2. Generates a bearer token in `bridge.env` (chmod 600, reused on re-runs).
+3. Writes and starts the services:
+   - Linux: `~/.config/systemd/user/opencode-serve.service` + `opencode-bridge.service`
+   - macOS: `~/Library/LaunchAgents/com.opencode.serve.plist` + `com.opencode.bridge.plist`
+4. Frees the ports first (kills stragglers holding 4090/4059).
+5. Verifies: waits for ports, fetches `/v1/models` for real, runs a live test completion
+   through the full stack.
+6. Configures Hermes: adds the `opencode-free-bridge` provider, stores the token in
+   `~/.hermes/.env` (never in config.yaml), and sets the default model.
+
+Options:
 
 ```bash
-opencode serve --port 4090 --hostname 127.0.0.1
-# listening on http://127.0.0.1:4090
+./install.sh --no-default-switch   # add provider, don't change the Hermes default model
+./install.sh --uninstall           # stop + remove services (Hermes config left alone)
 ```
 
-No API key needed for the free tier. (For paid Go models use the API key via
-`opencode auth login` or `OPENCODE_GO_API_KEY`.)
+Logs go to `./logs/opencode-serve.log` and `./logs/opencode-bridge.log`.
 
-### 3. Start the bridge
+### Manual (no services)
 
 ```bash
-python3 opencode_bridge.py
-# opencode free bridge on http://127.0.0.1:4059/v1
+npm i -g opencode-ai                    # NixOS: npm config set prefix ~/.local/npm first
+opencode serve --port 4090 --hostname 127.0.0.1 &
+OPENCODE_BRIDGE_TOKEN=mytoken python3 opencode_bridge.py
 ```
 
-Config via env: `OPENCODE_SERVER_URL` (default `http://127.0.0.1:4090`),
-`OPENCODE_BRIDGE_PORT` (default `4059`).
+## Config
 
-### 4. Test
+| Env var | Default | Purpose |
+|---|---|---|
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:4090` | opencode serve endpoint |
+| `OPENCODE_BRIDGE_PORT` | `4059` | bridge listen port |
+| `OPENCODE_BRIDGE_TOKEN` | random (printed) | Bearer token required by clients |
+| `OPENCODE_TIMEOUT` | `300` | upstream completions timeout (s) |
+| `OPENCODE_MODEL_REFRESH` | `3600` | re-fetch the model list every N s (0 = off) |
+
+## API
 
 ```bash
-curl http://127.0.0.1:4059/v1/models
-curl -X POST http://127.0.0.1:4059/v1/chat/completions \
-  -H 'Content-Type: application/json' \
+curl http://127.0.0.1:4059/v1/models -H "Authorization: Bearer $OPENCODE_BRIDGE_TOKEN"
+curl http://127.0.0.1:4059/v1/chat/completions \
+  -H "Authorization: Bearer $OPENCODE_BRIDGE_TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"muse-spark-1.3-contributor-free","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-### 5. Point Hermes at it
+- `GET /v1/models` — live list (fetched from opencode's config, falling back to a
+  built-in list if unavailable).
+- `POST /v1/chat/completions` — blocking or SSE streaming (`"stream": true`; the
+  stream is single-chunk: full text, then finish, then `[DONE]`).
+- `GET /health` — bridge liveness + model count.
 
-Add a custom OpenAI-compatible provider with `base_url: http://127.0.0.1:4059/v1` and the
-free models. (The bridge ignores the `Authorization` header, so any placeholder key works.)
+Unknown models are rejected with the list of available free models in the error body.
 
-## Models served
+## Hermes
 
-`ling-3.0-flash-fin-free`, `mimo-v2.5-free`, `muse-spark-1.2-contributor-free`,
-`muse-spark-1.3-contributor-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,
-`big-pickle`.
+```yaml
+providers:
+  opencode-free-bridge:
+    base_url: http://127.0.0.1:4059/v1
+    key_env: OPENCODE_BRIDGE_TOKEN
+    api_mode: chat_completions
+    default_model: muse-spark-1.3-contributor-free
+```
+
+`install.sh` sets this up; per-session switch: `/model opencode-free-bridge/<model>`.
+
+## Troubleshooting
+
+- **Requests hang / empty responses.** The upstream free tier can throttle or hang.
+  Sanity-check the path with a paid model through the same CLI:
+  `opencode run -m opencode-go/<your-go-model> 'Reply ok'`. If that answers fast while
+  free models stall, it's upstream, not the bridge — check OpenCode's status.
+- **`{"error":"unauthorized"}`** — client token doesn't match `bridge.env` / Hermes
+  `.env`. Same token must be in both.
+- **systemd: `systemctl --user status opencode-serve opencode-bridge`** and the
+  `logs/` files.
+- **Port conflicts.** The installer cleans 4090/4059; for manual runs make sure no old
+  `opencode serve`/bridge is still bound.
 
 ## Tailscale exposure
 
-Each service gets its own hostname + free HTTPS cert via Tailscale services — see
+Each service can get its own hostname + free HTTPS cert via Tailscale services — see
 [`tailscale.md`](tailscale.md).
 
 ## Limitations
 
-- **Non-streaming.** The bridge returns a complete response, not an SSE stream.
-- **Fresh session per request.** No server-side conversation memory; the full history is
-  re-sent each turn.
-- The `opencode serve` default is the "build" agent, so responses carry the build agent's
-  framing (and the server may report watched file changes). Responses are still plain
-  assistant text for chat-style prompts.
-- Bound to `127.0.0.1` by default — do not expose it beyond localhost (the OpenCode
-  server is unsecured unless `OPENCODE_SERVER_PASSWORD` is set).
+- **Non-incremental streaming** — SSE is real but arrives as one chunk.
+- **Fresh session per request** — no server-side memory; full history re-sent each turn.
+- The `opencode serve` default is the "build" agent; responses carry build-agent framing
+  but are plain assistant text for chat prompts.
+- Bound to `127.0.0.1` — do not expose beyond localhost without ALSO keeping the
+  bridge token private (`OPENCODE_SERVER_PASSWORD` protects the serve endpoint only).

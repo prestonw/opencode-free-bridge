@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+# opencode-free-bridge installer
+#
+# Sets up, on Linux (systemd user units) or macOS (launchd/launchctl):
+#   1. opencode CLI (via npm, if missing)
+#   2. opencode serve on 127.0.0.1:4090   (the "within OpenCode" client)
+#   3. opencode_bridge.py on 127.0.0.1:4059 (OpenAI-compatible proxy)
+#   4. Hermes config: opencode-free-bridge provider + default model
+#
+# Usage:
+#   ./install.sh              # install + start everything
+#   ./install.sh --no-hermes  # skip the Hermes config step
+#   ./install.sh --uninstall  # stop + remove services (keeps repo dir)
+#
+# Idempotent: safe to re-run; it replaces existing unit files.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_SCRIPT="$REPO_DIR/opencode_bridge.py"
+BRIDGE_PORT="${OPENCODE_BRIDGE_PORT:-4059}"
+SERVE_PORT="${OPENCODE_SERVE_PORT:-4090}"
+ENV_FILE="$REPO_DIR/bridge.env"
+LOG_TAG="[opencode-free-bridge]"
+
+say() { printf '%s %s\n' "$LOG_TAG" "$*"; }
+die() { printf '%s ERROR: %s\n' "$LOG_TAG" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- platform
+OS="$(uname -s)"
+case "$OS" in
+  Linux)  PLATFORM=linux ;;
+  Darwin) PLATFORM=macos ;;
+  *) die "unsupported OS: $OS" ;;
+esac
+
+# ---------------------------------------------------------------- token
+ensure_token() {
+  if [[ -s "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    if [[ -n "${OPENCODE_BRIDGE_TOKEN:-}" ]]; then
+      say "reusing existing bridge token from bridge.env"
+      return
+    fi
+  fi
+  local token
+  if command -v python3 >/dev/null 2>&1; then
+    token="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+  else
+    token="$(head -c32 /dev/urandom | base64 | tr -d '/+=' | head -c32)"
+  fi
+  cat > "$ENV_FILE" <<EOF
+OPENCODE_BRIDGE_TOKEN=$token
+OPENCODE_SERVER_URL=http://127.0.0.1:$SERVE_PORT
+EOF
+  chmod 600 "$ENV_FILE"
+  say "generated new bridge token -> $ENV_FILE"
+}
+
+# ---------------------------------------------------------------- npm / opencode
+ensure_opencode() {
+  # `.local/npm/bin` may not be on PATH (NixOS/macOS custom prefix), include it.
+  if [[ -x "$HOME/.local/npm/bin/opencode" ]] && ! command -v opencode >/dev/null 2>&1; then
+    export PATH="$HOME/.local/npm/bin:$PATH"
+  fi
+  if ! command -v opencode >/dev/null 2>&1; then
+    say "installing opencode-ai via npm"
+    # Global npm prefix may be read-only (NixOS); use a user prefix fallback.
+    if ! npm i -g opencode-ai 2>/dev/null; then
+      npm config set prefix "$HOME/.local/npm"
+      export PATH="$HOME/.local/npm/bin:$PATH"
+      npm i -g opencode-ai
+    fi
+    # Re-check after install, including the user-prefix location.
+    if ! command -v opencode >/dev/null 2>&1 && [[ -x "$HOME/.local/npm/bin/opencode" ]]; then
+      export PATH="$HOME/.local/npm/bin:$PATH"
+    fi
+  fi
+  command -v opencode >/dev/null 2>&1 || die "opencode not found on PATH after npm install (searched: \$PATH, \$HOME/.local/npm/bin)"
+  say "opencode CLI: $(command -v opencode)"
+  # make sure the systemd/launchd unit can find it too
+  export OPENCODE_BIN="$(command -v opencode)"
+}
+
+# ---------------------------------------------------------------- service mgmt
+UNAME="$(id -un)"
+
+write_env_hint() {
+  cat "$ENV_FILE" >&2
+}
+
+install_linux() {
+  local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$unit_dir" "$REPO_DIR/logs"
+
+  # Stop anything already bound to our ports: first the managed units, then stragglers.
+  systemctl --user disable --now opencode-bridge.service opencode-serve.service 2>/dev/null || true
+  systemctl --user reset-failed opencode-bridge.service opencode-serve.service 2>/dev/null || true
+  for p in "$SERVE_PORT" "$BRIDGE_PORT"; do
+    if python3 - "$p" <<'PY'
+import socket, sys
+s = socket.socket(); s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1]))); s.close(); sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+    then
+      say "port $p already in use — killing the process holding it"
+      local killer
+      killer="$(python3 - "$p" <<'PY'
+import subprocess, sys, re
+out = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True).stdout
+for line in out.splitlines():
+    if re.search(rf"127\.0\.0\.1:{sys.argv[1]}\s", line):
+        m = re.search(r"pid=(\d+)", line)
+        if m:
+            print(m.group(1))
+            break
+PY
+)"
+      [[ -n "$killer" ]] && { kill "$killer" 2>/dev/null || sudo kill "$killer" 2>/dev/null || true; sleep 1; }
+    fi
+  done
+
+  ensure_opencode
+  ensure_token
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+
+  local serve_bin
+  serve_bin="$(command -v opencode)"
+
+  cat > "$unit_dir/opencode-serve.service" <<EOF
+[Unit]
+Description=OpenCode headless server (free-tier backend)
+After=network-online.target
+
+[Service]
+ExecStart=$serve_bin serve --port $SERVE_PORT --hostname 127.0.0.1
+Restart=on-failure
+RestartSec=3
+Environment=PATH=$HOME/.local/npm/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$HOME
+WorkingDirectory=$REPO_DIR
+StandardOutput=append:$REPO_DIR/logs/opencode-serve.log
+StandardError=append:$REPO_DIR/logs/opencode-serve.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+  local py_bin
+  py_bin="$(command -v python3)"
+
+  cat > "$unit_dir/opencode-bridge.service" <<EOF
+[Unit]
+Description=OpenCode free bridge (OpenAI-compatible proxy, port $BRIDGE_PORT)
+After=opencode-serve.service
+Requires=opencode-serve.service
+
+[Service]
+ExecStart=/bin/sh -c 'set -a; [ -f $ENV_FILE ] && . $ENV_FILE; set +a; exec $py_bin $BRIDGE_SCRIPT'
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=$HOME
+WorkingDirectory=$REPO_DIR
+StandardOutput=append:$REPO_DIR/logs/opencode-bridge.log
+StandardError=append:$REPO_DIR/logs/opencode-bridge.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now opencode-serve.service opencode-bridge.service
+
+  # Linger so services survive logout/reboot
+  loginctl show-user "$UNAME" --property=Linger >/dev/null 2>&1 || true
+  if ! loginctl show-user "$UNAME" --property=Linger 2>/dev/null | grep -q '^Linger=yes'; then
+    say "attempting: sudo loginctl enable-linger $UNAME  (so services start at boot)"
+    sudo loginctl enable-linger "$UNAME" 2>/dev/null \
+      || say "WARNING: could not enable linger; services stop at logout until you run the sudo command above"
+  fi
+}
+
+install_macos() {
+  local plist_dir="$HOME/Library/LaunchAgents"
+  mkdir -p "$plist_dir" "$REPO_DIR/logs"
+
+  ensure_opencode
+  ensure_token
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+
+  local serve_bin py_bin
+  serve_bin="$(command -v opencode)"
+  py_bin="$(command -v python3)"
+
+  cat > "$plist_dir/com.opencode.serve.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.opencode.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$serve_bin</string><string>serve</string>
+    <string>--port</string><string>$SERVE_PORT</string>
+    <string>--hostname</string><string>127.0.0.1</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$REPO_DIR/logs/opencode-serve.log</string>
+  <key>StandardErrorPath</key><string>$REPO_DIR/logs/opencode-serve.log</string>
+</dict>
+</plist>
+EOF
+
+  cat > "$plist_dir/com.opencode.bridge.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.opencode.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$py_bin</string><string>$BRIDGE_SCRIPT</string>
+  </array>
+  <key>WorkingDirectory</key><string>$REPO_DIR</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OPENCODE_BRIDGE_TOKEN</key><string>$OPENCODE_BRIDGE_TOKEN</string>
+    <key>OPENCODE_SERVER_URL</key><string>http://127.0.0.1:$SERVE_PORT</string>
+    <key>OPENCODE_BRIDGE_PORT</key><string>$BRIDGE_PORT</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$REPO_DIR/logs/opencode-bridge.log</string>
+  <key>StandardErrorPath</key><string>$REPO_DIR/logs/opencode-bridge.log</string>
+</dict>
+</plist>
+EOF
+
+  launchctl bootout "gui/$(id -u)/com.opencode.serve" 2>/dev/null || true
+  launchctl bootout "gui/$(id -u)/com.opencode.bridge" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist_dir/com.opencode.serve.plist"
+  launchctl bootstrap "gui/$(id -u)" "$plist_dir/com.opencode.bridge.plist"
+  launchctl enable "gui/$(id -u)/com.opencode.serve"
+  launchctl enable "gui/$(id -u)/com.opencode.bridge"
+}
+
+# ---------------------------------------------------------------- wait for ports
+wait_port() {
+  local port="$1" tries=30
+  for _ in $(seq 1 "$tries"); do
+    if python3 - "$port" <<'PY'
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+    then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+verify() {
+  say "waiting for opencode serve on :$SERVE_PORT ..."
+  wait_port "$SERVE_PORT" || die "opencode serve did not come up — check $REPO_DIR/logs/opencode-serve.log"
+  say "waiting for bridge on :$BRIDGE_PORT ..."
+  wait_port "$BRIDGE_PORT" || die "opencode bridge did not come up — check $REPO_DIR/logs/opencode-bridge.log"
+  sleep 1  # give the bridge a second to fetch the model list
+
+  local token
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  token="${OPENCODE_BRIDGE_TOKEN:?no token in $ENV_FILE}"
+
+  local models_json models
+  models_json="$(python3 - "$token" "$BRIDGE_PORT" <<'PY'
+import json, sys, urllib.request
+req = urllib.request.Request(
+    f"http://127.0.0.1:{sys.argv[2]}/v1/models",
+    headers={"Authorization": f"Bearer {sys.argv[1]}"},
+)
+try:
+    d = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    print(",".join(m["id"] for m in d["data"]))
+except Exception as e:
+    sys.exit(f"model list failed: {e}")
+PY
+)" || die "bridge /v1/models failed"
+
+  # Pick the fastest-feeling default: prefer muse-spark-1.3-contributor-free.
+  local default_model=""
+  for m in muse-spark-1.3-contributor-free mimo-v2.5-free ling-3.0-flash-fin-free; do
+    if [[ ",$models_json," == *",$m,"* ]]; then default_model="$m"; break; fi
+  done
+  [[ -n "$default_model" ]] || default_model="${models_json%%,*}"
+
+  say "models: $(echo "$models_json" | tr ',' ' ')"
+  echo "$default_model" > "$REPO_DIR/.default_model"
+
+  # --- live test call
+  say "test completion (may take ~10–30s) ..."
+  local curl_out
+  curl_out="$(curl -s -m 120 http://127.0.0.1:"$BRIDGE_PORT"/v1/chat/completions \
+    -H "Authorization: Bearer ${OPENCODE_BRIDGE_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$default_model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: ok\"}]}")"
+  echo "$curl_out" | grep -q '"finish_reason":"stop"' \
+    || die "test completion failed: $curl_out"
+  say "test completion OK: $(echo "$curl_out" | head -c200)"
+}
+
+# ---------------------------------------------------------------- hermes config
+install_hermes() {
+  command -v hermes >/dev/null 2>&1 || { say "hermes not found — skipping Hermes config"; return; }
+
+  local token default_model
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  token="${OPENCODE_BRIDGE_TOKEN:?no token in $ENV_FILE}"
+  default_model="$(cat "$REPO_DIR/.default_model" 2>/dev/null || echo muse-spark-1.3-contributor-free)"
+
+  say "configuring Hermes: provider opencode-free-bridge -> 127.0.0.1:$BRIDGE_PORT"
+  hermes config set providers.opencode-free-bridge.base_url "http://127.0.0.1:$BRIDGE_PORT/v1"
+  hermes config set providers.opencode-free-bridge.key_env "OPENCODE_BRIDGE_TOKEN"
+  hermes config set providers.opencode-free-bridge.api_mode "chat_completions"
+  hermes config set providers.opencode-free-bridge.default_model "$default_model"
+
+  # Store the token in Hermes .env (never config.yaml)
+  local hermes_env="${HERMES_HOME:-$HOME/.hermes}/.env"
+  touch "$hermes_env"; chmod 600 "$hermes_env"
+  if grep -q '^OPENCODE_BRIDGE_TOKEN=' "$hermes_env"; then
+    sed -i.bak "s|^OPENCODE_BRIDGE_TOKEN=.*|OPENCODE_BRIDGE_TOKEN=$token|" "$hermes_env"
+  else
+    printf '\nOPENCODE_BRIDGE_TOKEN=%s\n' "$token" >> "$hermes_env"
+  fi
+  say "token written to $hermes_env as OPENCODE_BRIDGE_TOKEN"
+
+  if [[ "${1:-}" != "--no-default-switch" ]]; then
+    hermes config set model.default "$default_model"
+    hermes config set model.provider "opencode-free-bridge"
+    hermes config set model.base_url "http://127.0.0.1:$BRIDGE_PORT/v1"
+    hermes config set model.api_mode "chat_completions"
+    say "Hermes default model -> $default_model (opencode-free-bridge)"
+  fi
+}
+
+# ---------------------------------------------------------------- uninstall
+uninstall() {
+  if systemctl --user list-unit-files 2>/dev/null | grep -q opencode-bridge; then
+    systemctl --user disable --now opencode-bridge.service opencode-serve.service || true
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/opencode-bridge.service \
+          "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/opencode-serve.service
+    systemctl --user daemon-reload || true
+    say "systemd units removed"
+  fi
+  if [[ -d "$HOME/Library/LaunchAgents" ]]; then
+    for lbl in com.opencode.serve com.opencode.bridge; do
+      launchctl bootout "gui/$(id -u)/$lbl" 2>/dev/null || true
+      rm -f "$HOME/Library/LaunchAgents/$lbl.plist"
+    done
+    say "launchd agents removed"
+  fi
+  say "uninstalled (N.B. Hermes config untouched — remove manually if wanted)"
+}
+
+# ---------------------------------------------------------------- main
+case "${1:-install}" in
+  install)
+    case "$PLATFORM" in linux) install_linux ;; macos) install_macos ;; esac
+    verify
+    install_hermes "${2:-}"
+    say "done. bridge: http://127.0.0.1:$BRIDGE_PORT/v1 (token in $ENV_FILE)"
+    say "hermes alias: /model opencode-free-bridge/$default_model"
+    say "n.b. token is also in $ENV_FILE — add to shell rc as 'export OPENCODE_BRIDGE_TOKEN=...' if needed"
+    ;;
+  uninstall)
+    uninstall
+    ;;
+  --uninstall)
+    uninstall
+    ;;
+  *)
+    die "usage: $0 [install] | --uninstall"
+    ;;
+esac
