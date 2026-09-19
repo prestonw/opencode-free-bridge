@@ -1,6 +1,7 @@
 bridge.env
 logs/
 .default_model
+data/
 __pycache__/
 *.pyc
 .env
