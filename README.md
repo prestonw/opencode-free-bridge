@@ -133,6 +133,31 @@ providers:
 - **Port conflicts.** The installer cleans 4090/4059; for manual runs make sure no old
   `opencode serve`/bridge is still bound.
 
+## Paid multi-account router (optional)
+
+`manage-accounts.sh` runs N isolated **paid** OpenCode instances — one per account
+(`auth.json` Go or Zen key) — each on its own serve port, and load-balances them
+behind one router endpoint. Each profile is a genuinely distinct account (own
+key, own workspace, own on-disk state); the router just spreads requests evenly
+across them and fails over when one errors.
+
+```bash
+./manage-accounts.sh add <auth.json>   # register an account profile
+./manage-accounts.sh list
+./manage-accounts.sh upgrade           # write + start services, verify
+./manage-accounts.sh stop|start|restart
+./manage-accounts.sh remove <index|all>
+```
+
+The pool listens on port **4060** with the same `/v1` surface: `/v1/models` is the
+union across accounts, `POST /v1/chat/completions` round-robins (with per-account
+failover), and `/health` reports `accounts_up`. Point any OpenAI client at
+`http://127.0.0.1:4060/v1` with the same bridge token.
+
+Note: accounts must be different real accounts (separate subscriptions). The
+router does not attempt to mask or correlate away client identity — each profile
+authenticates exactly as its own OpenCode account.
+
 ## Tailscale exposure
 
 Each service can get its own hostname + free HTTPS cert via Tailscale services — see
