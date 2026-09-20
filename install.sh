@@ -19,6 +19,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE_SCRIPT="$REPO_DIR/opencode_bridge.py"
 BRIDGE_PORT="${OPENCODE_BRIDGE_PORT:-4059}"
 SERVE_PORT="${OPENCODE_SERVE_PORT:-4090}"
+ROUTER_PORT="${OPENCODE_ROUTER_PORT:-4060}"
 ENV_FILE="$REPO_DIR/bridge.env"
 LOG_TAG="[opencode-free-bridge]"
 
@@ -30,7 +31,8 @@ OS="$(uname -s)"
 case "$OS" in
   Linux)  PLATFORM=linux ;;
   Darwin) PLATFORM=macos ;;
-  *) die "unsupported OS: $OS" ;;
+  *CYGWIN*|*MINGW*) PLATFORM=windows ;;
+  *) die "unsupported OS: $OS (use windows-install.ps1 on Windows)" ;;
 esac
 
 # ---------------------------------------------------------------- token
@@ -374,44 +376,102 @@ install_hermes() {
     hermes config set model.api_mode "chat_completions"
     say "Hermes default model -> $default_model (opencode-free-bridge)"
   fi
+  # Always register the paid-pool provider too (harmless if accounts aren't set up yet)
+  hermes config set providers.opencode-paid-router.base_url "http://127.0.0.1:$ROUTER_PORT/v1"
+  hermes config set providers.opencode-paid-router.key_env "OPENCODE_BRIDGE_TOKEN"
+  hermes config set providers.opencode-paid-router.api_mode "chat_completions"
+  hermes config set providers.opencode-paid-router.default_model "glm-5.3-flash"
+  say "Hermes provider opencode-paid-router registered -> 127.0.0.1:$ROUTER_PORT (glm-5.3-flash)"
 }
 
 # ---------------------------------------------------------------- uninstall
-uninstall() {
-  if systemctl --user list-unit-files 2>/dev/null | grep -q opencode-bridge; then
-    systemctl --user disable --now opencode-bridge.service opencode-serve.service || true
-    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/opencode-bridge.service \
-          "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/opencode-serve.service
+cleanup_stale() {
+  # UPGRADE CLEANUP: remove stale service units/agents left by previous versions.
+  local py
+  py="$(command -v python3)"
+  # All opencode-* units this installer used to manage (any version)
+  local stale
+  stale="$(systemctl --user list-unit-files --type=service --no-legend 2>/dev/null \
+    | awk '{print $1}' | grep -E '^opencode-(serve|bridge|paid-router)' || true)"
+  if [[ -n "$stale" ]]; then
+    systemctl --user stop $stale 2>/dev/null || true
+    for u in $stale; do
+      systemctl --user disable "$u" 2>/dev/null || true
+      rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$u"
+    done
     systemctl --user daemon-reload || true
-    say "systemd units removed"
+    systemctl --user reset-failed 2>/dev/null || true
+    say "upgrade cleanup: removed stale units: $(echo "$stale" | tr '\n' ' ')"
   fi
+}
+
+uninstall() {
+  cleanup_stale
+  systemctl --user disable --now opencode-bridge.service opencode-serve.service 2>/dev/null || true
+  systemctl --user disable --now opencode-paid-router.service opencode-serve-*.service 2>/dev/null || \
+    bash -c 'systemctl --user list-unit-files | grep -E "^opencode-(paid-router|serve-)" | awk "{print \$1}" | xargs -r systemctl --user disable --now' 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/opencode-{bridge,serve,paid-router}.service \
+        "${XDG_CONFIG_HOME:-$HOME/.config}"/systemd/user/opencode-serve-*.service
+  systemctl --user daemon-reload || true
+  say "systemd units removed"
   if [[ -d "$HOME/Library/LaunchAgents" ]]; then
-    for lbl in com.opencode.serve com.opencode.bridge; do
+    for lbl in com.opencode.serve com.opencode.bridge com.opencode.paid-router; do
       launchctl bootout "gui/$(id -u)/$lbl" 2>/dev/null || true
       rm -f "$HOME/Library/LaunchAgents/$lbl.plist"
     done
+    # per-account agents
+    for f in "$HOME/Library/LaunchAgents"/com.opencode.serve-acc*.plist; do
+      [[ -e "$f" ]] || continue
+      launchctl bootout "gui/$(id -u)/$(basename "$f" .plist)" 2>/dev/null || true
+      rm -f "$f"
+    done
     say "launchd agents removed"
   fi
-  say "uninstalled (N.B. Hermes config untouched — remove manually if wanted)"
+  say "uninstalled (Hermes config untouched — remove manually if wanted)"
+}
+
+upgrade_cleanup() {
+  case "$PLATFORM" in
+    linux)  cleanup_stale ;;
+    macos)
+      # remove per-account agents before re-adding (macOS)
+      for f in "$HOME/Library/LaunchAgents"/com.opencode.serve-acc*.plist; do
+        [[ -e "$f" ]] || continue
+        launchctl bootout "gui/$(id -u)/$(basename "$f" .plist)" 2>/dev/null || true
+        rm -f "$f"
+      done
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------- main
 case "${1:-install}" in
   install)
+    upgrade_cleanup || true
     case "$PLATFORM" in linux) install_linux ;; macos) install_macos ;; esac
     verify
     install_hermes "${2:-}"
     say "done. bridge: http://127.0.0.1:$BRIDGE_PORT/v1 (token in $ENV_FILE)"
     say "hermes alias: /model opencode-free-bridge/$(cat "$REPO_DIR/.default_model" 2>/dev/null || echo muse-spark-1.3-contributor-free)"
-    say "n.b. token is also in $ENV_FILE — add to shell rc as 'export OPENCODE_BRIDGE_TOKEN=...' if needed"
+    if compgen -G "$REPO_DIR/accounts/*/auth.json" > /dev/null; then
+      say "paid accounts detected -> running manage-accounts.sh upgrade"
+      "$REPO_DIR/manage-accounts.sh" upgrade || say "WARNING: paid pool upgrade failed (see manage-accounts.sh output)"
+    else
+      say "no paid accounts registered (optional: $0/manage-accounts.sh add <auth.json>)"
+    fi
+    ;;
+  --paid)
+    "$REPO_DIR/manage-accounts.sh" upgrade
     ;;
   uninstall)
     uninstall
+    "$REPO_DIR/manage-accounts.sh" remove all 2>/dev/null || true
     ;;
   --uninstall)
     uninstall
+    "$REPO_DIR/manage-accounts.sh" remove all 2>/dev/null || true
     ;;
   *)
-    die "usage: $0 [install] | --uninstall"
+    die "usage: $0 [install | --paid | --uninstall]"
     ;;
 esac

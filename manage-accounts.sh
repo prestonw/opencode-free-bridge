@@ -229,6 +229,122 @@ start_all_linux() {
   say "services started"
 }
 
+# ---- macOS (launchd) ----------------------------------------------------------
+install_macos_all() {
+  local plist_dir="$HOME/Library/LaunchAgents"
+  mkdir -p "$plist_dir" "$REPO_DIR/logs"
+  ensure_opencode
+
+  # need the router token
+  # shellcheck disable=SC1090
+  [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+  OPENCODE_BRIDGE_TOKEN="${OPENCODE_BRIDGE_TOKEN:-}"
+  if [[ -z "$OPENCODE_BRIDGE_TOKEN" ]]; then
+    OPENCODE_BRIDGE_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+    { grep -v '^OPENCODE_BRIDGE_TOKEN=' "$ENV_FILE" 2>/dev/null || true;
+      echo "OPENCODE_BRIDGE_TOKEN=$OPENCODE_BRIDGE_TOKEN"; } > "$ENV_FILE.new" && mv "$ENV_FILE.new" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
+
+  local serve_bin py_bin
+  serve_bin="$(command -v opencode)"
+  py_bin="$(command -v python3)"
+
+  # out with the old
+  for lbl in OpencodePaidRouter OpencodeServeAcc; do
+    for f in "$plist_dir"/com.opencode.*.plist; do
+      [[ -e "$f" ]] || continue
+      launchctl bootout "gui/$(id -u)/$(basename "$f" .plist)" 2>/dev/null || true
+      rm -f "$f"
+    done
+  done
+
+  local idx=0 ports=()
+  for d in "$ACC_DIR"/*/; do
+    [[ -f "$d/auth.json" ]] || continue
+    idx=$((idx+1))
+    local port=$((4090 + idx))
+    [[ "$port" == "${SERVE_PORT:-4090}" ]] && port=$((port+1))
+    ports+=("$port")
+    mkdir -p "$d/xdg-share/opencode" "$d/xdg-config/opencode"
+    cp "$d/auth.json" "$d/xdg-share/opencode/auth.json"
+    chmod 600 "$d/xdg-share/opencode/auth.json"
+
+    cat > "$plist_dir/com.opencode.serve-acc$idx.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.opencode.serve-acc$idx</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$serve_bin</string><string>serve</string>
+    <string>--port</string><string>$port</string>
+    <string>--hostname</string><string>127.0.0.1</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>XDG_DATA_HOME</key><string>$d/xdg-share</string>
+    <key>XDG_CONFIG_HOME</key><string>$d/xdg-config</string>
+  </dict>
+  <key>StandardOutPath</key><string>$REPO_DIR/logs/serve-$idx.log</string>
+  <key>StandardErrorPath</key><string>$REPO_DIR/logs/serve-$idx.log</string>
+</dict>
+</plist>
+EOF
+    launchctl bootstrap "gui/$(id -u)" "$plist_dir/com.opencode.serve-acc$idx.plist"
+  done
+
+  [[ $idx -gt 0 ]] || die "no account profiles registered (use: $0 add <auth.json>)"
+
+  cat > "$plist_dir/com.opencode.paid-router.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.opencode.paid-router</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$py_bin</string><string>$REPO_DIR/opencode_paid_router.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>$REPO_DIR</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OPENCODE_SERVE_PORTS</key><string>$(IFS=,; echo "${ports[*]}")</string>
+    <key>OPENCODE_BRIDGE_PORT</key><string>$ROUTER_PORT</string>
+    <key>OPENCODE_PROVIDER</key><string>opencode-go</string>
+    <key>OPENCODE_BRIDGE_TOKEN</key><string>$OPENCODE_BRIDGE_TOKEN</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$REPO_DIR/logs/paid-router.log</string>
+  <key>StandardErrorPath</key><string>$REPO_DIR/logs/paid-router.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootstrap "gui/$(id -u)" "$plist_dir/com.opencode.paid-router.plist"
+  say "started $idx account servers + router (launchd). ports: $(IFS=,; echo "${ports[*]}") -> $ROUTER_PORT"
+}
+
+stop_all_macos() {
+  for f in "$HOME/Library/LaunchAgents"/com.opencode.{serve-acc*,paid-router}.plist; do
+    [[ -e "$f" ]] || continue
+    launchctl bootout "gui/$(id -u)/$(basename "$f" .plist)" 2>/dev/null || true
+  done
+  say "services stopped"
+}
+
+start_all_macos() {
+  for f in "$HOME/Library/LaunchAgents"/com.opencode.{serve-acc*,paid-router}.plist; do
+    [[ -e "$f" ]] || continue
+    launchctl bootstrap "gui/$(id -u)" "$f"
+  done
+  say "services started"
+}
+
 verify_all() {
   local free_port="${SERVE_PORT:-4090}"
   local route_port="$ROUTER_PORT"
@@ -270,10 +386,12 @@ cmd="${1:-list}"
 case "$cmd" in
   add)      shift; cmd_add "$@" ;;
   list)     cmd_list ;;
-  upgrade)  install_linux_all; verify_all ;;
-  stop)     stop_all_linux ;;
-  start)    start_all_linux ;;
-  restart)  stop_all_linux; start_all_linux; sleep 2; verify_all ;;
+  upgrade)  case "$PLATFORM" in linux) install_linux_all;; macos) install_macos_all;; esac; verify_all ;;
+  stop)     case "$PLATFORM" in linux) stop_all_linux;; macos) stop_all_macos;; esac ;;
+  start)    case "$PLATFORM" in linux) start_all_linux;; macos) start_all_macos;; esac ;;
+  restart)
+    case "$PLATFORM" in linux) stop_all_linux; start_all_linux;; macos) stop_all_macos; start_all_macos;; esac
+    sleep 2; verify_all ;;
   remove)   shift; cmd_remove "$@" ;;
   *) die "usage: $0 add <auth.json> | list | upgrade | start | stop | restart | remove <index|all>" ;;
 esac

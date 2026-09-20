@@ -110,6 +110,18 @@ providers:
 
 `install.sh` sets this up; per-session switch: `/model opencode-free-bridge/<model>`.
 
+## Platforms
+
+| OS | Services run via | Install command |
+|---|---|---|
+| Linux | systemd user units | `./install.sh` |
+| macOS | launchd LaunchAgents | `./install.sh` |
+| Windows | Task Scheduler tasks | `powershell -ExecutionPolicy Bypass -File windows-install.ps1` (`-Uninstall` to remove, `-FreeOnly` to skip the paid pool) |
+
+All three platforms install the same two stacks — the keyless free bridge (:4059)
+and the paid multi-account pool (:4060). Upgrade cleanup (stale units/agents removed
+before re-install) runs automatically in every path.
+
 ## Troubleshooting
 
 - **Requests hang / empty responses.** Check opencode's own log first:
